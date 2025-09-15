@@ -1,0 +1,24 @@
+{
+  "unifi": {
+    "host": "https://192.168.1.1",
+    "username": "user",
+    "password": "password",
+    "site": "default"
+  },
+  "qr_api": {
+    "url": "http://192.168.2.9",
+    "api_key": "qr_api_Km9pKkL2BqfIK908vwTVpoMwB3r7ylm5",
+    "wifi_endpoint": "/wifi",
+    "update_password_endpoint": "/update-password",
+    "library_endpoint": "/library"
+  },
+  "monitor": {
+    "check_interval": 60,
+    "networks_to_ignore": [
+      "IOT",
+      "TV"
+    ],
+    "log_level": "DEBUG",
+    "force_sync": false
+  }
+}
