@@ -1,24 +1,105 @@
 {
   "unifi": {
+    "enabled": true,
     "host": "https://192.168.1.1",
-    "username": "user",
-    "password": "password",
+    "username": "poller",
+    "password": "poller",
     "site": "default"
   },
   "qr_api": {
+    "enabled": true,
     "url": "http://192.168.2.9",
     "api_key": "qr_api_Km9pKkL2BqfIK908vwTVpoMwB3r7ylm5",
     "wifi_endpoint": "/wifi",
     "update_password_endpoint": "/update-password",
     "library_endpoint": "/library"
   },
+  "schedules": {
+    "unifi_wifi_schedule": {
+      "enabled": true,
+      "description": "Schedule for syncing WiFi network settings and QR codes",
+      "cron_expressions": [
+        "*/30 * * * 0",
+        "0 * * * 1",
+        "0 * * * 2",
+        "0 * * * 3",
+        "0 * * * 4",
+        "0 * * * 5",
+        "0 * * * 6"
+      ]
+    },
+    "unifi_wan_throughput_schedule": {
+      "enabled": true,
+      "description": "Schedule for collecting WAN throughput metrics",
+      "cron_expressions": [
+        "*/5 * * * * *"
+      ]
+    },
+    "unifi_client_usage_schedule": {
+      "enabled": true,
+      "description": "Schedule for collecting client usage metrics",
+      "cron_expressions": [
+        "*/5 * * * * *"
+      ]
+    }
+  },
+  "_schedule_examples": {
+    "_comment": "Cron expression examples - remove this section in production",
+    "6_part_format": "second minute hour day month weekday",
+    "5_part_format": "minute hour day month weekday",
+    "examples": {
+      "every_30_seconds": "*/30 * * * * *",
+      "every_15_seconds": "*/15 * * * * *",
+      "every_5_minutes": "*/5 * * * *",
+      "every_2_minutes_at_30_seconds": "30 */2 * * * *",
+      "every_hour_at_15_minutes_30_seconds": "30 15 * * * *",
+      "daily_at_9_AM": "0 0 9 * * *",
+      "daily_at_2_30_45_PM": "45 30 14 * * *",
+      "weekly_monday_at_9_AM": "0 0 9 * * 1",
+      "every_weekday_at_8_AM": "0 0 8 * * 1-5"
+    }
+  },
   "monitor": {
-    "check_interval": 60,
     "networks_to_ignore": [
       "IOT",
       "TV"
     ],
-    "log_level": "DEBUG",
-    "force_sync": false
+    "log_level": "INFO",
+    "_log_level_comment": "Levels: DEBUG, INFO, WARNING, ERROR, CRITICAL",
+    "force_sync": false,
+    "debug_settings": {
+      "level": "MINIMAL",
+      "_comment": "Levels: SILENT, MINIMAL, NORMAL, VERBOSE, FULL",
+      "enable_api_debug": false,
+      "enable_schedule_debug": false,
+      "enable_unifi_api_debug": false,
+      "enable_influxdb_debug": false,
+      "enable_web_debug": false,
+      "log_unifi_responses": false,
+      "log_influxdb_writes": false,
+      "log_successful_operations": true,
+      "log_errors_only": false,
+      "quiet_mode": false,
+      "max_log_response_length": 500
+    }
+  },
+  "influxdb": {
+    "enabled": true,
+    "url": "http://10.1.10.252:8086",
+    "token": "kBph8i8gN8KmvHgoduCPg0qfkrqyGe44YtxR4olRzynWMWQwo047HVo6biygcLh0NVIK7lkw29buAHhiXRKpdg==",
+    "org": "ORG",
+    "bucket": "unifi"
+  },
+  "web_interface": {
+    "enabled": true,
+    "port": 80,
+    "allowed_ips": [
+      "127.0.0.1",
+      "::1",
+      "192.168.1.0/24"
+    ],
+    "allow_all_for_dashboard": true
   }
 }
+
+

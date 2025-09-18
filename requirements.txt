@@ -1,2 +1,51 @@
-requests>=2.31.0
-urllib3>=2.0.0
+{
+  "6376ce9111ce4a3e4f4ca775": {
+    "name": "BCOSMedia",
+    "ssid": "BCOSMedia",
+    "security": "wpapsk",
+    "hash": "2cad4c068ea775e9ff32da70a57aa4e8",
+    "last_synced": "2025-09-18T01:39:59.980036"
+  },
+  "64543bcc9789220dff369134": {
+    "name": "BCOS_SundaySchool",
+    "ssid": "BCOS_SundaySchool",
+    "security": "wpapsk",
+    "hash": "9463bf0eeedc64d74c6b5d22cefc639b",
+    "last_synced": "2025-09-18T01:40:00.009936"
+  },
+  "675c7fee5e06584b6b65a85a": {
+    "name": "BCOS",
+    "ssid": "BCOS",
+    "security": "wpapsk",
+    "hash": "9a6fcef1116edecedf49c71c8bb6c675",
+    "last_synced": "2025-09-18T01:40:00.009962"
+  },
+  "67ad3ace9a5a1d43ffee00b5": {
+    "name": "BCOSPastor",
+    "ssid": "BCOSPastor",
+    "security": "wpapsk",
+    "hash": "f460cb0e1c92caee1ac6632ae5d6aafb",
+    "last_synced": "2025-09-18T01:40:00.009980"
+  },
+  "68379e333b82802fc14feceb": {
+    "name": "Choir",
+    "ssid": "Choir",
+    "security": "wpapsk",
+    "hash": "a2a25cbe0c0cbc8b16438460c4a41e5d",
+    "last_synced": "2025-09-18T01:40:00.009990"
+  },
+  "68995b202383c7186a0569fa": {
+    "name": "Print Media",
+    "ssid": "Print Media",
+    "security": "wpapsk",
+    "hash": "384c0b365626d943e5c7682475595b74",
+    "last_synced": "2025-09-18T01:40:00.009997"
+  },
+  "68af962e2383c7186a0e592b": {
+    "name": "BCOSGuest",
+    "ssid": "BCOSGuest",
+    "security": "wpapsk",
+    "hash": "852a483bb9bc1b3a4e328d14717937a4",
+    "last_synced": "2025-09-18T01:40:00.010004"
+  }
+}
