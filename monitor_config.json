@@ -2,13 +2,13 @@
   "unifi": {
     "enabled": true,
     "host": "https://192.168.1.1",
-    "username": "poller",
-    "password": "poller",
+    "username": "admin",
+    "password": "password",
     "site": "default"
   },
   "qr_api": {
     "enabled": true,
-    "url": "http://192.168.2.9",
+    "url": "http://192.168.1.9",
     "api_key": "qr_api_Km9pKkL2BqfIK908vwTVpoMwB3r7ylm5",
     "wifi_endpoint": "/wifi",
     "update_password_endpoint": "/update-password",
@@ -17,29 +17,23 @@
   "schedules": {
     "unifi_wifi_schedule": {
       "enabled": true,
-      "description": "Schedule for syncing WiFi network settings and QR codes",
+      "description": "Schedule for syncing WiFi network settings and QR codes every 2 minutes",
       "cron_expressions": [
-        "*/30 * * * 0",
-        "0 * * * 1",
-        "0 * * * 2",
-        "0 * * * 3",
-        "0 * * * 4",
-        "0 * * * 5",
-        "0 * * * 6"
+        "0 */5 * * * *"
       ]
     },
     "unifi_wan_throughput_schedule": {
       "enabled": true,
-      "description": "Schedule for collecting WAN throughput metrics",
+      "description": "Schedule for collecting WAN throughput metrics every 15 seconds",
       "cron_expressions": [
-        "*/5 * * * * *"
+        "*/15 * * * * *"
       ]
     },
     "unifi_client_usage_schedule": {
       "enabled": true,
-      "description": "Schedule for collecting client usage metrics",
+      "description": "Schedule for collecting client usage metrics every 15 seconds",
       "cron_expressions": [
-        "*/5 * * * * *"
+        "*/15 * * * * *"
       ]
     }
   },
@@ -62,9 +56,9 @@
   "monitor": {
     "networks_to_ignore": [
       "IOT",
-      "TV"
+      "A!"
     ],
-    "log_level": "INFO",
+    "log_level": "DEBUG",
     "_log_level_comment": "Levels: DEBUG, INFO, WARNING, ERROR, CRITICAL",
     "force_sync": false,
     "debug_settings": {
@@ -85,7 +79,7 @@
   },
   "influxdb": {
     "enabled": true,
-    "url": "http://10.1.10.252:8086",
+    "url": "http://192.168.1.252:8086",
     "token": "kBph8i8gN8KmvHgoduCPg0qfkrqyGe44YtxR4olRzynWMWQwo047HVo6biygcLh0NVIK7lkw29buAHhiXRKpdg==",
     "org": "ORG",
     "bucket": "unifi"
@@ -99,6 +93,13 @@
       "192.168.1.0/24"
     ],
     "allow_all_for_dashboard": true
+  },
+  "system": {
+    "service_name": "Unifi2QR-API.service",
+    "use_systemctl_restart": true,
+    "auto_restart_on_auth_failure": true,
+    "_service_name_comment": "Name of the systemd service for restart functionality. Set use_systemctl_restart to false to use legacy restart method.",
+    "_auto_restart_comment": "Set auto_restart_on_auth_failure to false to disable automatic service restart when authentication fails repeatedly."
   }
 }
 

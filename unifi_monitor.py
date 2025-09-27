@@ -18,12 +18,117 @@ import schedule
 import threading
 import os
 import sys
-from flask import Flask, render_template_string, jsonify, request
+from flask import Flask, jsonify, request
 import ipaddress
 from functools import wraps
+import glob
+import shutil
 
 # Disable SSL warnings for self-signed certificates
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+def clear_python_cache():
+    """Clear Python cache files (.pyc) and __pycache__ directories"""
+    try:
+        cache_cleared = False
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+
+        # Get current working directory
+        current_dir = os.getcwd()
+
+        # List of directories to clean cache from
+        dirs_to_clean = [script_dir, current_dir]
+
+        # Add common systemctl service directories
+        common_service_dirs = [
+            '/opt/unifi-monitor',
+            '/usr/local/bin',
+            '/home/unifi',
+            '/root',
+            '.'
+        ]
+
+        # Only add directories that exist
+        for dir_path in common_service_dirs:
+            if os.path.exists(dir_path):
+                dirs_to_clean.append(dir_path)
+
+        # Remove duplicates
+        dirs_to_clean = list(set(dirs_to_clean))
+
+        for directory in dirs_to_clean:
+            try:
+                # Change to the directory to clean
+                original_cwd = os.getcwd()
+                os.chdir(directory)
+
+                # Remove .pyc files in this directory tree
+                for pyc_file in glob.glob("**/*.pyc", recursive=True):
+                    try:
+                        os.remove(pyc_file)
+                        cache_cleared = True
+                    except OSError:
+                        pass
+
+                # Remove __pycache__ directories in this directory tree
+                for cache_dir in glob.glob("**/__pycache__", recursive=True):
+                    try:
+                        shutil.rmtree(cache_dir)
+                        cache_cleared = True
+                    except OSError:
+                        pass
+
+                # Also try system-wide Python cache clearing
+                try:
+                    import sys
+                    if hasattr(sys, 'path'):
+                        for path in sys.path:
+                            if os.path.exists(path):
+                                for root, dirs, files in os.walk(path):
+                                    # Remove __pycache__ directories
+                                    if '__pycache__' in dirs:
+                                        try:
+                                            shutil.rmtree(os.path.join(root, '__pycache__'))
+                                            cache_cleared = True
+                                        except OSError:
+                                            pass
+                                    # Remove .pyc files
+                                    for file in files:
+                                        if file.endswith('.pyc'):
+                                            try:
+                                                os.remove(os.path.join(root, file))
+                                                cache_cleared = True
+                                            except OSError:
+                                                pass
+                except Exception:
+                    pass
+
+                # Restore original working directory
+                os.chdir(original_cwd)
+
+            except Exception:
+                # Continue with next directory if this one fails
+                try:
+                    os.chdir(original_cwd)
+                except:
+                    pass
+                continue
+
+        # Force Python to invalidate import cache
+        try:
+            import importlib
+            importlib.invalidate_caches()
+            cache_cleared = True
+        except Exception:
+            pass
+
+        if cache_cleared:
+            logging.info("Python cache cleared successfully from multiple locations")
+        else:
+            logging.info("No Python cache files found to clear")
+
+    except Exception as e:
+        logging.warning(f"Error clearing Python cache: {e}")
 
 class DebugLogger:
     """Configurable debug logging utility"""
@@ -124,12 +229,23 @@ class DebugLogger:
         if self.log_success:
             self.log('general', 'INFO', f"{operation} completed successfully. {details}".strip())
 
+# Configure logging with rotation
+from logging.handlers import RotatingFileHandler
+
+# Create a rotating file handler (max 10MB, keep 5 backup files)
+file_handler = RotatingFileHandler(
+    'unifi_monitor.log',
+    maxBytes=10*1024*1024,  # 10MB
+    backupCount=5
+)
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('unifi_monitor.log'),
+        file_handler,
         logging.StreamHandler()
     ]
 )
@@ -182,6 +298,109 @@ class UniFiController:
             logging.error(f"Authentication failed: {e}")
             return False
 
+    def _make_authenticated_request(self, url: str, max_retries: int = 2):
+        """Make authenticated request with automatic re-authentication and restart fallback"""
+        import time
+        import subprocess
+        import os
+        import sys
+
+        for attempt in range(max_retries + 1):
+            try:
+                # Ensure we're authenticated
+                if not self.cookies:
+                    if not self.login():
+                        logging.warning(f"Authentication failed on attempt {attempt + 1}")
+                        continue
+
+                # Make the request
+                response = self.session.get(url, cookies=self.cookies, timeout=10)
+
+                # Check for authentication errors
+                if response.status_code == 401 or response.status_code == 403:
+                    print(f"🔄 AUTHENTICATION EXPIRED - Re-authenticating with UniFi controller...")
+                    logging.warning(f"Authentication expired (HTTP {response.status_code}), attempting re-authentication")
+                    self.cookies = None  # Clear invalid cookies
+
+                    # Try to re-authenticate
+                    if self.login():
+                        print(f"✅ RE-AUTHENTICATION SUCCESSFUL - Service resuming normal operation")
+                        response = self.session.get(url, cookies=self.cookies, timeout=10)
+                    else:
+                        print(f"❌ RE-AUTHENTICATION FAILED - Will retry in next cycle")
+                        logging.error("Re-authentication failed")
+                        continue
+
+                response.raise_for_status()
+                return response
+
+            except Exception as e:
+                logging.warning(f"Request attempt {attempt + 1} failed: {e}")
+                self.cookies = None  # Clear potentially invalid cookies
+
+                if attempt < max_retries:
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                    continue
+                else:
+                    # All retries failed, check if we should restart service
+                    logging.error(f"All {max_retries + 1} request attempts failed for {url}")
+
+                    # Try one final re-authentication
+                    if self.login():
+                        print(f"✅ FINAL RE-AUTHENTICATION SUCCESSFUL - Service continuing")
+                        logging.info("Final re-authentication successful, service continuing")
+                        return None
+                    else:
+                        print(f"🚨 CRITICAL: Unable to authenticate with UniFi controller after {max_retries + 1} attempts!")
+                        logging.critical("Critical: Unable to authenticate with UniFi controller after multiple attempts")
+
+                        # Check if automatic restart is enabled
+                        system_config = self.config.get('system', {})
+                        auto_restart = system_config.get('auto_restart_on_auth_failure', True)
+
+                        if auto_restart:
+                            print(f"🔄 TRIGGERING AUTOMATIC SERVICE RESTART due to persistent authentication failures...")
+                            logging.warning("Triggering automatic service restart due to persistent authentication failures")
+                            self._trigger_service_restart()
+
+                        return None
+
+        return None
+
+    def _trigger_service_restart(self):
+        """Trigger service restart using configured method"""
+        try:
+            import threading
+            import time
+
+            def restart_service():
+                time.sleep(3)  # Allow current operations to complete
+
+                # Get system configuration
+                system_config = self.config.get('system', {})
+                use_systemctl = system_config.get('use_systemctl_restart', True)
+                service_name = system_config.get('service_name', 'unifi-monitor')
+
+                if use_systemctl:
+                    try:
+                        logging.info(f"Attempting systemctl restart of {service_name}")
+                        subprocess.run(['systemctl', 'restart', service_name],
+                                     check=True, capture_output=True, text=True)
+                        logging.info("Service restart command sent successfully")
+                        return
+                    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                        logging.warning(f"Systemctl restart failed: {e}, falling back to process restart")
+
+                # Fallback to process restart
+                logging.info("Restarting service using process restart")
+                os.execv(sys.executable, ['python'] + sys.argv)
+
+            restart_thread = threading.Thread(target=restart_service, daemon=True)
+            restart_thread.start()
+
+        except Exception as e:
+            logging.error(f"Failed to trigger service restart: {e}")
+
     def get_wireless_networks(self) -> Optional[List[Dict]]:
         """Retrieve all wireless network configurations using legacy API"""
         try:
@@ -202,9 +421,9 @@ class UniFiController:
                 try:
                     url = f"{self.host}{endpoint}"
                     logging.debug(f"Trying endpoint: {url}")
-                    response = self.session.get(url, cookies=self.cookies, timeout=10)
+                    response = self._make_authenticated_request(url)
 
-                    if response.status_code == 200:
+                    if response and response.status_code == 200:
                         logging.info(f"Successfully connected using: {endpoint}")
                         data = response.json()
 
@@ -231,8 +450,9 @@ class UniFiController:
             if self.login():
                 try:
                     url = f"{self.host}/api/s/{self.site}/rest/wlanconf"
-                    response = self.session.get(url, cookies=self.cookies, timeout=10)
-                    response.raise_for_status()
+                    response = self._make_authenticated_request(url)
+                    if not response:
+                        return None
                     data = response.json()
                     return data.get('data', [])
                 except Exception as retry_error:
@@ -502,6 +722,18 @@ class QRCodeUpdater:
             return None
         except Exception as e:
             logging.error(f"Failed to search library for {ssid}: {e}")
+            return None
+
+    def get_qr_entry_details(self, ssid: str) -> Optional[Dict]:
+        """Get full QR entry details including password for this SSID"""
+        try:
+            entries = self.get_qr_library()
+            for entry in entries:
+                if entry.get('ssid') == ssid:
+                    return entry
+            return None
+        except Exception as e:
+            logging.error(f"Failed to get QR entry details for {ssid}: {e}")
             return None
 
     def find_orphaned_qr_by_elimination(self, active_networks: List[Dict]) -> Optional[Dict]:
@@ -780,14 +1012,86 @@ class TaskScheduler:
             # Handle second intervals
             if second.startswith("*/"):
                 interval = int(second[2:])
-                schedule.every(interval).seconds.do(job_func)
-                logging.info(f"Scheduled {job_description}every {interval} seconds: {cron_expression}")
-                return
+
+                # Check for weekday-specific time ranges (e.g., "*/5 * 10-11 * * 0")
+                if hour != "*" and weekday.isdigit():
+                    if "-" in hour:
+                        start_h, end_h = map(int, hour.split("-"))
+                        weekdays = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+                        weekday_name = weekdays[int(weekday)]
+
+                        def time_range_wrapper():
+                            now = datetime.now()
+                            current_weekday = now.weekday()  # 0=Monday, 6=Sunday
+                            target_weekday = int(weekday) % 7  # Convert cron weekday (0=Sunday) to Python weekday
+                            if target_weekday == 0:  # Sunday in cron is 0, but Python weekday Sunday is 6
+                                target_weekday = 6
+                            else:
+                                target_weekday -= 1  # Adjust for Python's 0=Monday vs cron's 1=Monday
+
+                            # Check if it's the right day and within time range
+                            if current_weekday == target_weekday and start_h <= now.hour <= end_h:
+                                job_func()
+
+                        schedule.every(interval).seconds.do(time_range_wrapper)
+                        logging.info(f"Scheduled {job_description}every {interval} seconds on {weekday_name} {start_h}:00-{end_h+1}:00: {cron_expression}")
+                        return
+                    else:
+                        # Single hour with weekday
+                        target_hour = int(hour)
+                        weekdays = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+                        weekday_name = weekdays[int(weekday)]
+
+                        def single_hour_wrapper():
+                            now = datetime.now()
+                            current_weekday = now.weekday()  # 0=Monday, 6=Sunday
+                            target_weekday = int(weekday) % 7  # Convert cron weekday (0=Sunday) to Python weekday
+                            if target_weekday == 0:  # Sunday in cron is 0, but Python weekday Sunday is 6
+                                target_weekday = 6
+                            else:
+                                target_weekday -= 1  # Adjust for Python's 0=Monday vs cron's 1=Monday
+
+                            # Check if it's the right day and hour
+                            if current_weekday == target_weekday and now.hour == target_hour:
+                                job_func()
+
+                        schedule.every(interval).seconds.do(single_hour_wrapper)
+                        logging.info(f"Scheduled {job_description}every {interval} seconds on {weekday_name} at {target_hour}:xx: {cron_expression}")
+                        return
+                else:
+                    # Regular second interval (all times)
+                    schedule.every(interval).seconds.do(job_func)
+                    logging.info(f"Scheduled {job_description}every {interval} seconds: {cron_expression}")
+                    return
 
             # Handle minute intervals with specific seconds
             elif minute.startswith("*/"):
                 interval = int(minute[2:])
-                if second == "0":
+
+                # Check if this is weekday-specific (e.g., "0 */5 * * * 0" - every 5 min on Sunday)
+                if weekday.isdigit() and day == "*" and hour == "*":
+                    weekdays = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+                    weekday_name = weekdays[int(weekday)]
+
+                    def weekday_interval_wrapper():
+                        current_weekday = datetime.now().weekday()  # 0=Monday, 6=Sunday
+                        target_weekday = int(weekday) % 7  # Convert cron weekday (0=Sunday) to Python weekday
+                        if target_weekday == 0:  # Sunday in cron is 0, but Python weekday Sunday is 6
+                            target_weekday = 6
+                        else:
+                            target_weekday -= 1  # Adjust for Python's 0=Monday vs cron's 1=Monday
+
+                        if current_weekday == target_weekday:
+                            job_func()
+
+                    if second == "0":
+                        schedule.every(interval).minutes.do(weekday_interval_wrapper)
+                        logging.info(f"Scheduled {job_description}every {interval} minutes on {weekday_name}: {cron_expression}")
+                    else:
+                        schedule.every().minute.do(weekday_interval_wrapper)
+                        logging.warning(f"Approximating {job_description}schedule on {weekday_name} (checking every minute): {cron_expression}")
+                    return
+                elif second == "0":
                     schedule.every(interval).minutes.do(job_func)
                 else:
                     # Schedule library doesn't support minute intervals with specific seconds
@@ -820,10 +1124,31 @@ class TaskScheduler:
             # Handle weekly schedules with seconds
             elif hour.isdigit() and minute.isdigit() and second.isdigit() and day == "*" and weekday.isdigit():
                 time_str = f"{hour.zfill(2)}:{minute.zfill(2)}:{second.zfill(2)}"
-                weekdays = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+                weekdays = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
                 weekday_name = weekdays[int(weekday)]
                 getattr(schedule.every(), weekday_name).at(time_str).do(job_func)
                 logging.info(f"Scheduled {job_description}weekly on {weekday_name} at {time_str}: {cron_expression}")
+                return
+
+            # Handle hourly schedules on specific weekdays (e.g., "0 0 * * * 1" = every hour on Monday)
+            elif second == "0" and minute == "0" and hour == "*" and day == "*" and weekday.isdigit():
+                weekdays = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+                weekday_name = weekdays[int(weekday)]
+
+                def weekday_hourly_wrapper():
+                    current_weekday = datetime.now().weekday()  # 0=Monday, 6=Sunday
+                    target_weekday = int(weekday) % 7  # Convert cron weekday (0=Sunday) to Python weekday
+                    if target_weekday == 0:  # Sunday in cron is 0, but Python weekday Sunday is 6
+                        target_weekday = 6
+                    else:
+                        target_weekday -= 1  # Adjust for Python's 0=Monday vs cron's 1=Monday
+
+                    if current_weekday == target_weekday:
+                        job_func()
+
+                # Schedule to run every hour and check if it's the right day
+                schedule.every().hour.do(weekday_hourly_wrapper)
+                logging.info(f"Scheduled {job_description}every hour on {weekday_name}: {cron_expression}")
                 return
 
         elif len(parts) == 5:
@@ -834,9 +1159,53 @@ class TaskScheduler:
             if minute.startswith("*/"):
                 interval = int(minute[2:])
 
+                # Check if this is weekday-specific with hour ranges (e.g., "*/1 10-11 * * 0")
+                if weekday.isdigit() and day == "*" and hour != "*":
+                    weekdays = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+                    weekday_name = weekdays[int(weekday)]
+
+                    if "-" in hour:
+                        start_h, end_h = hour.split("-")
+                        start_h, end_h = int(start_h), int(end_h)
+
+                        def time_range_wrapper():
+                            now = datetime.now()
+                            current_weekday = now.weekday()
+                            target_weekday = int(weekday) % 7
+                            if target_weekday == 0:
+                                target_weekday = 6
+                            else:
+                                target_weekday -= 1
+
+                            if current_weekday == target_weekday and start_h <= now.hour <= end_h:
+                                job_func()
+
+                        schedule.every(interval).minutes.do(time_range_wrapper)
+                        logging.info(f"Scheduled {job_description}every {interval} minutes on {weekday_name} {start_h}:00-{end_h+1}:00: {cron_expression}")
+                        return
+                    else:
+                        # Single hour (e.g., "*/1 10 * * 0" - every 1 minute during hour 10 on Sunday)
+                        target_hour = int(hour)
+
+                        def single_hour_wrapper():
+                            now = datetime.now()
+                            current_weekday = now.weekday()
+                            target_weekday = int(weekday) % 7
+                            if target_weekday == 0:
+                                target_weekday = 6
+                            else:
+                                target_weekday -= 1
+
+                            if current_weekday == target_weekday and now.hour == target_hour:
+                                job_func()
+
+                        schedule.every(interval).minutes.do(single_hour_wrapper)
+                        logging.info(f"Scheduled {job_description}every {interval} minutes on {weekday_name} at {target_hour}:xx: {cron_expression}")
+                        return
+
                 # Check if this is weekday-specific (e.g., "*/30 * * * 0" - every 30 min on Sunday)
-                if weekday.isdigit() and day == "*" and hour == "*":
-                    weekdays = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+                elif weekday.isdigit() and day == "*" and hour == "*":
+                    weekdays = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
                     weekday_name = weekdays[int(weekday)]
 
                     def weekday_interval_wrapper():
@@ -880,7 +1249,7 @@ class TaskScheduler:
             # Handle weekly schedules (specific time)
             elif hour.isdigit() and minute.isdigit() and day == "*" and weekday.isdigit():
                 time_str = f"{hour.zfill(2)}:{minute.zfill(2)}"
-                weekdays = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+                weekdays = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
                 weekday_name = weekdays[int(weekday)]
                 getattr(schedule.every(), weekday_name).at(time_str).do(job_func)
                 logging.info(f"Scheduled {job_description}weekly on {weekday_name} at {time_str}: {cron_expression}")
@@ -888,7 +1257,7 @@ class TaskScheduler:
 
             # Handle hourly schedules on specific weekdays (e.g., "0 * * * 1" = every hour on Monday)
             elif minute.isdigit() and hour == "*" and day == "*" and weekday.isdigit():
-                weekdays = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+                weekdays = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
                 weekday_name = weekdays[int(weekday)]
 
                 # Create a wrapper function that checks the current weekday
@@ -926,6 +1295,11 @@ class TaskScheduler:
             self.running = True
             self.scheduler_thread = threading.Thread(target=self._run_scheduler, daemon=True)
             self.scheduler_thread.start()
+
+            # Schedule daily cache clearing at 3 AM
+            schedule.every().day.at("03:00").do(clear_python_cache)
+            logging.info("Scheduled daily Python cache clearing at 3:00 AM")
+
             logging.info("Task scheduler started")
 
     def _run_scheduler(self):
@@ -947,6 +1321,7 @@ class NetworkMonitor:
         self.config_file = config_file
         self.state_file = 'network_state.json'
         self.mapping_file = 'network_qr_mapping.json'  # Track UniFi network ID -> QR ID
+        self.last_runs_file = 'schedule_last_runs.json'  # Track last 7 days of schedule executions
         self.config = self.load_config()
 
         # Set logging level from config
@@ -1060,12 +1435,118 @@ class NetworkMonitor:
         with open(self.mapping_file, 'w') as f:
             json.dump(mapping, f, indent=2)
 
+    def load_last_runs(self) -> Dict:
+        """Load last run tracking data"""
+        try:
+            with open(self.last_runs_file, 'r') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {
+                "wifi_sync": [],
+                "wan_metrics": [],
+                "client_metrics": []
+            }
+
+    def save_last_runs(self, last_runs: Dict):
+        """Save last run tracking data"""
+        with open(self.last_runs_file, 'w') as f:
+            json.dump(last_runs, f, indent=2)
+
+    def record_last_run(self, job_type: str, timestamp: str = None, status: str = "success", details: str = ""):
+        """Record a job execution with timestamp and details"""
+        if timestamp is None:
+            timestamp = datetime.now().isoformat()
+
+        last_runs = self.load_last_runs()
+
+        # Ensure job type exists
+        if job_type not in last_runs:
+            last_runs[job_type] = []
+
+        # Add new execution record
+        execution_record = {
+            "timestamp": timestamp,
+            "status": status,
+            "details": details
+        }
+        last_runs[job_type].append(execution_record)
+
+        # Keep only last 7 days (168 hours) of records
+        cutoff_time = datetime.now() - timedelta(days=7)
+        last_runs[job_type] = [
+            record for record in last_runs[job_type]
+            if datetime.fromisoformat(record["timestamp"]) > cutoff_time
+        ]
+
+        # Sort by timestamp (newest first)
+        last_runs[job_type].sort(key=lambda x: x["timestamp"], reverse=True)
+
+        self.save_last_runs(last_runs)
+
+    def get_latest_run(self, job_type: str) -> Dict:
+        """Get the most recent execution for a job type"""
+        last_runs = self.load_last_runs()
+        if job_type in last_runs and last_runs[job_type]:
+            return last_runs[job_type][0]  # First item is newest due to sorting
+        return None
+
+    def format_time_ago(self, timestamp: str) -> str:
+        """Format timestamp as time ago string"""
+        try:
+            from datetime import datetime, timezone
+            run_time = datetime.fromisoformat(timestamp)
+            now = datetime.now()
+
+            # Handle timezone-aware datetime
+            if run_time.tzinfo is not None:
+                now = now.replace(tzinfo=timezone.utc)
+
+            time_diff = now - run_time
+            total_seconds = int(time_diff.total_seconds())
+
+            if total_seconds < 60:
+                return f"{total_seconds} seconds ago"
+            elif total_seconds < 3600:
+                minutes = total_seconds // 60
+                return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+            elif total_seconds < 86400:
+                hours = total_seconds // 3600
+                return f"{hours} hour{'s' if hours != 1 else ''} ago"
+            else:
+                days = total_seconds // 86400
+                return f"{days} day{'s' if days != 1 else ''} ago"
+        except:
+            return "Unknown"
+
     def get_network_hash(self, network: Dict) -> str:
         """Generate hash for network configuration including password hash"""
         # Include password hash for change detection (but don't store the actual password)
         password_hash = hashlib.md5(network['password'].encode()).hexdigest() if network['password'] else 'none'
         network_str = f"{network['ssid']}:{network['security']}:{network['enabled']}:{password_hash}"
         return hashlib.md5(network_str.encode()).hexdigest()
+
+    def check_password_drift(self, network: Dict) -> bool:
+        """Check if UniFi password differs from QR API password"""
+        if not self.qr_updater.enabled:
+            return False
+
+        try:
+            qr_entry = self.qr_updater.get_qr_entry_details(network['ssid'])
+            if not qr_entry:
+                # No QR entry exists, no drift possible
+                return False
+
+            unifi_password = network.get('password', '')
+            qr_password = qr_entry.get('password', '')
+
+            if unifi_password != qr_password:
+                logging.warning(f"Password drift detected for {network['ssid']}: UniFi != QR API")
+                return True
+
+            return False
+        except Exception as e:
+            logging.error(f"Failed to check password drift for {network['ssid']}: {e}")
+            return False
 
     def sync_networks_to_qr(self) -> bool:
         """Sync all wireless networks to QR system and write metrics immediately"""
@@ -1098,21 +1579,42 @@ class NetworkMonitor:
             network_id = network['id']
             network_hash = self.get_network_hash(network)
 
+            # Generate combined hash including QR API state for drift detection
+            combined_hash = network_hash
+            if self.qr_updater.enabled:
+                qr_entry = self.qr_updater.get_qr_entry_details(network['ssid'])
+                if qr_entry:
+                    qr_password = qr_entry.get('password', '')
+                    qr_password_hash = hashlib.md5(qr_password.encode()).hexdigest() if qr_password else 'none'
+                    combined_str = f"{network_hash}:qr_{qr_password_hash}"
+                    combined_hash = hashlib.md5(combined_str.encode()).hexdigest()
+
             # Store minimal state (no passwords)
             current_state[network_id] = {
                 'name': network['name'],
                 'ssid': network['ssid'],
                 'security': network['security'],
                 'hash': network_hash,
+                'combined_hash': combined_hash,
                 'last_synced': datetime.now().isoformat()
             }
 
-            # Check if this network needs updating
-            needs_update = (
-                network_id not in self.last_state or
-                self.last_state[network_id]['hash'] != network_hash or
-                self.config['monitor'].get('force_sync', False)
-            )
+            # Check if this network needs updating (using combined hash for drift detection)
+            unifi_changed = network_id not in self.last_state or self.last_state[network_id]['hash'] != network_hash
+            drift_detected = network_id in self.last_state and self.last_state[network_id].get('combined_hash') != combined_hash and self.last_state[network_id]['hash'] == network_hash
+            force_sync = self.config['monitor'].get('force_sync', False)
+
+            needs_update = unifi_changed or drift_detected or force_sync
+
+            # Debug hash comparison
+            if network_id in self.last_state:
+                last_combined = self.last_state[network_id].get('combined_hash', 'none')
+                last_network = self.last_state[network_id].get('hash', 'none')
+                logging.debug(f"Hash comparison for {network['ssid']}: current_combined={combined_hash}, last_combined={last_combined}, current_network={network_hash}, last_network={last_network}")
+                logging.debug(f"Drift check: network_unchanged={self.last_state[network_id]['hash'] == network_hash}, combined_changed={last_combined != combined_hash}")
+
+            if drift_detected:
+                logging.warning(f"Password drift detected for {network['ssid']}: QR API password differs from UniFi")
 
             # Always check if QR entry still exists (handles deleted QR entries)
             if not needs_update and self.qr_updater.enabled:
@@ -1120,6 +1622,8 @@ class NetworkMonitor:
                 if not existing_qr:
                     logging.warning(f"QR entry missing for {network['ssid']}, will recreate")
                     needs_update = True
+
+            # Password drift is now automatically detected by combined_hash comparison above
 
             if needs_update and self.qr_updater.enabled:
                 logging.info(f"Processing network: {network['name']}")
@@ -1163,6 +1667,14 @@ class NetworkMonitor:
         self.save_state(current_state)
         self.save_network_mapping(self.network_mapping)
         self.last_state = current_state
+
+        # Record execution for tracking
+        status = "success" if sync_successful else "failed"
+        network_count = len(current_state)
+        details = f"Synced {network_count} networks"
+        if not sync_successful:
+            details += " (with errors)"
+        self.record_last_run("wifi_sync", status=status, details=details)
 
         return sync_successful
 
@@ -1216,52 +1728,101 @@ class NetworkMonitor:
             logging.info(f"Client usage schedule: {client_schedule.get('description', 'No description')}")
 
     def collect_wan_metrics(self):
-        """Collect and write WAN throughput metrics immediately to InfluxDB"""
+        """Collect WAN throughput metrics"""
+        if not self.unifi.enabled:
+            self.debug.log('unifi', 'DEBUG', "UniFi integration disabled, skipping WAN metrics collection")
+            return
+
+        self.debug.log_schedule_event('collect_wan_metrics', 'Starting WAN metrics collection')
+
         try:
-            if not self.unifi.enabled:
-                self.debug.log('unifi', 'DEBUG', "UniFi integration disabled, skipping WAN metrics")
-                return
-
-            self.debug.log_schedule_event('collect_wan_metrics', 'Starting')
             wan_data = self.unifi.get_wan_throughput()
-
             if wan_data:
-                # Write immediately to InfluxDB if enabled
                 if self.influx_writer.enabled:
                     self.influx_writer.write_wan_throughput(wan_data)
                     self.debug.log_database_write('wan_throughput', 1, True)
-                    self.debug.log('unifi', 'DEBUG', f"WAN throughput: {wan_data['rx_rate']:.2f} RX, {wan_data['tx_rate']:.2f} TX bytes/sec")
-                    self.debug.log_success_operation('WAN metrics collection')
-                else:
-                    self.debug.log('unifi', 'INFO', f"WAN metrics collected but InfluxDB disabled: {wan_data['rx_rate']:.2f} RX, {wan_data['tx_rate']:.2f} TX bytes/sec")
+                details = f"RX: {wan_data['rx_rate']:.2f}, TX: {wan_data['tx_rate']:.2f} bytes/sec"
+                self.record_last_run("wan_metrics", status="success", details=details)
+                self.debug.log_success_operation('WAN metrics collection', details)
             else:
-                self.debug.log('unifi', 'WARNING', "No WAN data returned from UniFi API")
+                self.record_last_run("wan_metrics", status="failed", details="No WAN data returned")
         except Exception as e:
             self.debug.log('unifi', 'ERROR', f"Error collecting WAN metrics: {e}")
+            self.record_last_run("wan_metrics", status="failed", details=f"Error: {str(e)}")
 
     def collect_client_metrics(self):
-        """Collect and write client usage metrics immediately to InfluxDB"""
+        """Collect client usage metrics"""
+        if not self.unifi.enabled:
+            self.debug.log('unifi', 'DEBUG', "UniFi integration disabled, skipping client metrics collection")
+            return
+
+        self.debug.log_schedule_event('collect_client_metrics', 'Starting client metrics collection')
+
         try:
-            if not self.unifi.enabled:
-                self.debug.log('unifi', 'DEBUG', "UniFi integration disabled, skipping client metrics")
-                return
-
-            self.debug.log_schedule_event('collect_client_metrics', 'Starting')
             top_clients = self.unifi.get_top_clients(15)
-
             if top_clients:
-                # Write immediately to InfluxDB if enabled
                 if self.influx_writer.enabled:
                     self.influx_writer.write_client_usage(top_clients)
                     self.debug.log_database_write('client_usage', len(top_clients), True)
-                    self.debug.log('unifi', 'DEBUG', f"Client usage written ({len(top_clients)} clients)")
-                    self.debug.log_success_operation('Client metrics collection', f"{len(top_clients)} clients processed")
-                else:
-                    self.debug.log('unifi', 'INFO', f"Client metrics collected but InfluxDB disabled: {len(top_clients)} clients")
+                details = f"Collected {len(top_clients)} clients"
+                self.record_last_run("client_metrics", status="success", details=details)
+                self.debug.log_success_operation('Client metrics collection', details)
             else:
-                self.debug.log('unifi', 'WARNING', "No client data returned from UniFi API")
+                self.record_last_run("client_metrics", status="failed", details="No client data returned")
         except Exception as e:
             self.debug.log('unifi', 'ERROR', f"Error collecting client metrics: {e}")
+            self.record_last_run("client_metrics", status="failed", details=f"Error: {str(e)}")
+
+    def collect_all_metrics(self):
+        """Combined metrics collection - collects WiFi, WAN, and client metrics in one session"""
+        if not self.unifi.enabled:
+            self.debug.log('unifi', 'DEBUG', "UniFi integration disabled, skipping combined metrics collection")
+            return
+
+        self.debug.log_schedule_event('collect_all_metrics', 'Starting combined collection')
+
+        # Collect WiFi networks
+        try:
+            self.sync_networks_to_qr()
+        except Exception as e:
+            self.debug.log('unifi', 'ERROR', f"Error in WiFi sync during combined collection: {e}")
+
+        # Small delay between API calls to be gentle on the controller
+        time.sleep(0.5)
+
+        # Collect WAN metrics
+        try:
+            wan_data = self.unifi.get_wan_throughput()
+            if wan_data:
+                if self.influx_writer.enabled:
+                    self.influx_writer.write_wan_throughput(wan_data)
+                    self.debug.log_database_write('wan_throughput', 1, True)
+                details = f"RX: {wan_data['rx_rate']:.2f}, TX: {wan_data['tx_rate']:.2f} bytes/sec"
+                self.record_last_run("wan_metrics", status="success", details=details)
+            else:
+                self.record_last_run("wan_metrics", status="failed", details="No WAN data returned")
+        except Exception as e:
+            self.debug.log('unifi', 'ERROR', f"Error collecting WAN metrics in combined collection: {e}")
+            self.record_last_run("wan_metrics", status="failed", details=f"Error: {str(e)}")
+
+        # Small delay between API calls
+        time.sleep(0.5)
+
+        # Collect client metrics
+        try:
+            top_clients = self.unifi.get_top_clients(15)
+            if top_clients:
+                if self.influx_writer.enabled:
+                    self.influx_writer.write_client_usage(top_clients)
+                    self.debug.log_database_write('client_usage', len(top_clients), True)
+                self.record_last_run("client_metrics", status="success", details=f"Collected {len(top_clients)} clients")
+            else:
+                self.record_last_run("client_metrics", status="failed", details="No client data returned")
+        except Exception as e:
+            self.debug.log('unifi', 'ERROR', f"Error collecting client metrics in combined collection: {e}")
+            self.record_last_run("client_metrics", status="failed", details=f"Error: {str(e)}")
+
+        self.debug.log_success_operation('Combined metrics collection', 'All metrics collected in one session')
 
     def run_monitor(self):
         """Main monitoring loop with scheduled tasks"""
@@ -1337,8 +1898,95 @@ class WebInterface:
             return decorated_function
         return decorator
 
+    def describe_cron_expressions(self, cron_expressions):
+        """Convert cron expressions to human-readable descriptions"""
+        if not cron_expressions:
+            return "No schedule defined"
+
+        descriptions = []
+
+        for cron_expr in cron_expressions:
+            parts = cron_expr.strip().split()
+
+            # Handle 6-part format: second minute hour day month weekday
+            if len(parts) == 6:
+                second, minute, hour, day, month, weekday = parts
+
+                # Common patterns for our use case
+                if second.startswith('*/') and minute == '*' and hour == '*' and day == '*' and month == '*' and weekday == '*':
+                    # Every X seconds: "*/15 * * * * *"
+                    interval = int(second[2:])
+                    if interval < 60:
+                        descriptions.append(f"Every {interval} seconds")
+                    else:
+                        descriptions.append(f"Every {interval//60} minutes")
+
+                elif second == '0' and minute.startswith('*/') and hour == '*' and day == '*' and month == '*' and weekday == '*':
+                    # Every X minutes: "0 */2 * * * *"
+                    interval = int(minute[2:])
+                    descriptions.append(f"Every {interval} minutes")
+
+                elif second == '0' and minute == '0' and hour.startswith('*/') and day == '*' and month == '*' and weekday == '*':
+                    # Every X hours: "0 0 */2 * * *"
+                    interval = int(hour[2:])
+                    descriptions.append(f"Every {interval} hours")
+
+                elif second == '0' and minute == '0' and hour.isdigit() and day == '*' and month == '*' and weekday == '*':
+                    # Daily at specific hour: "0 0 9 * * *"
+                    descriptions.append(f"Daily at {hour}:00")
+
+                else:
+                    # Show raw cron for complex expressions
+                    descriptions.append(f"Cron: {cron_expr}")
+
+            # Handle 5-part format: minute hour day month weekday
+            elif len(parts) == 5:
+                minute, hour, day, month, weekday = parts
+
+                if minute.startswith('*/') and hour == '*' and day == '*' and month == '*' and weekday == '*':
+                    # Every X minutes: "*/5 * * * *"
+                    interval = int(minute[2:])
+                    descriptions.append(f"Every {interval} minutes")
+
+                elif minute == '0' and hour.startswith('*/') and day == '*' and month == '*' and weekday == '*':
+                    # Every X hours: "0 */2 * * *"
+                    interval = int(hour[2:])
+                    descriptions.append(f"Every {interval} hours")
+
+                elif minute.isdigit() and hour.isdigit() and day == '*' and month == '*' and weekday == '*':
+                    # Daily at specific time: "30 14 * * *"
+                    descriptions.append(f"Daily at {hour}:{minute.zfill(2)}")
+
+                else:
+                    # Show raw cron for complex expressions
+                    descriptions.append(f"Cron: {cron_expr}")
+
+            else:
+                # Unknown format
+                descriptions.append(f"Cron: {cron_expr}")
+
+        return "; ".join(descriptions) if descriptions else "No valid schedule found"
+
+
+    def get_schedule_info(self):
+        """Get schedule information with descriptions"""
+        schedules_config = self.monitor.config.get('schedules', {})
+        schedule_info = {}
+
+        for schedule_name, schedule_config in schedules_config.items():
+            if schedule_config.get('enabled', True):
+                cron_expressions = schedule_config.get('cron_expressions', [])
+                description = self.describe_cron_expressions(cron_expressions)
+                schedule_info[schedule_name] = {
+                    'description': description,
+                    'config_description': schedule_config.get('description', 'No description')
+                }
+
+        return schedule_info
+
     def get_next_schedule_times(self):
         """Get next execution times for scheduled tasks"""
+        # CODE VERSION: 2025-09-19-v2 - Enhanced cache clearing and schedule detection
         next_times = {}
         try:
             now = datetime.now()
@@ -1361,20 +2009,72 @@ class WebInterface:
                         seconds_until = (next_run - now).total_seconds()
 
                     if seconds_until and seconds_until > 0:
-                        # Check for sync_networks function (WiFi sync)
-                        if ('sync_networks' in job_func_str or 'sync_wifi' in job_func_str or
-                            'wifi' in job_func_str.lower() or 'weekday_interval_wrapper' in job_func_str or
-                            'weekday_hourly_wrapper' in job_func_str):
-                            # For WiFi sync, only store the shortest time (closest execution)
-                            if 'wifi_sync' not in next_times or seconds_until < next_times['wifi_sync']:
-                                next_times['wifi_sync'] = int(seconds_until)
-                                logging.debug(f"Added wifi_sync timer: {int(seconds_until)} seconds")
-                        elif 'collect_wan' in job_func_str or 'wan' in job_func_str.lower():
-                            if 'wan_metrics' not in next_times or seconds_until < next_times['wan_metrics']:
-                                next_times['wan_metrics'] = int(seconds_until)
-                        elif 'collect_client' in job_func_str or 'client' in job_func_str.lower():
-                            if 'client_metrics' not in next_times or seconds_until < next_times['client_metrics']:
-                                next_times['client_metrics'] = int(seconds_until)
+                        # Try to get the actual function from the wrapper
+                        actual_func = None
+                        try:
+                            # Check if it's a partial function (wrapper)
+                            if hasattr(job.job_func, 'func'):
+                                # Get the wrapped function's closure variables
+                                closure = job.job_func.func.__closure__
+                                if closure:
+                                    for cell in closure:
+                                        if hasattr(cell.cell_contents, '__name__'):
+                                            actual_func = cell.cell_contents
+                                            break
+                        except:
+                            pass
+
+                        # Determine job type based on actual function or wrapper type
+                        job_type = None
+                        if actual_func:
+                            func_name = actual_func.__name__
+                            if 'sync_networks' in func_name or 'sync_wifi' in func_name:
+                                job_type = 'wifi_sync'
+                            elif 'collect_wan' in func_name:
+                                job_type = 'wan_metrics'
+                            elif 'collect_client' in func_name:
+                                job_type = 'client_metrics'
+
+                        # Fall back to wrapper type analysis if function detection fails
+                        if not job_type:
+                            if ('weekday_interval_wrapper' in job_func_str or 'weekday_hourly_wrapper' in job_func_str):
+                                job_type = 'wifi_sync'  # Default wrapper jobs to WiFi for now
+                            elif 'time_range_wrapper' in job_func_str:
+                                # Need to determine if this is WAN or Client based on execution time patterns
+                                # For now, we'll track all time_range_wrapper jobs and assign them later
+                                if not hasattr(self, '_time_range_jobs'):
+                                    self._time_range_jobs = []
+                                self._time_range_jobs.append((job, seconds_until))
+
+                        if job_type:
+                            # Store the shortest time for each job type
+                            if job_type not in next_times or seconds_until < next_times[job_type]:
+                                next_times[job_type] = int(seconds_until)
+                                logging.debug(f"Added {job_type} timer: {int(seconds_until)} seconds")
+
+            # Handle time_range_wrapper jobs that we couldn't classify
+            if hasattr(self, '_time_range_jobs') and self._time_range_jobs:
+                # Sort by execution time to assign the earliest ones
+                self._time_range_jobs.sort(key=lambda x: x[1])
+
+                # Assign based on number of jobs and timing patterns
+                wan_assigned = False
+                client_assigned = False
+
+                for job, seconds_until in self._time_range_jobs:
+                    if not wan_assigned:
+                        if 'wan_metrics' not in next_times or seconds_until < next_times['wan_metrics']:
+                            next_times['wan_metrics'] = int(seconds_until)
+                        wan_assigned = True
+                    elif not client_assigned:
+                        if 'client_metrics' not in next_times or seconds_until < next_times['client_metrics']:
+                            next_times['client_metrics'] = int(seconds_until)
+                        client_assigned = True
+                    else:
+                        break
+
+                # Clean up temporary tracking
+                delattr(self, '_time_range_jobs')
 
             logging.debug(f"Final next_times: {next_times}")
             return next_times
@@ -1526,12 +2226,11 @@ class WebInterface:
         .status.error { background: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; }
         .info-box { background: #e9ecef; padding: 15px; border-radius: 6px; margin: 15px 0; }
         .schedule-info { font-size: 12px; color: #666; margin-top: 5px; }
-        .countdown-timer {
-            background: #fff3cd; border: 1px solid #ffeaa7; color: #856404;
+        .last-run-timer {
+            background: #d1ecf1; border: 1px solid #bee5eb; color: #0c5460;
             padding: 8px 12px; border-radius: 4px; font-weight: bold;
             margin: 5px 0; font-size: 11px;
         }
-        .countdown-timer.soon { background: #f8d7da; border-color: #f5c6cb; color: #721c24; }
         .next-schedules { margin: 15px 0; }
         .api-examples { background: #f8f9fa; padding: 15px; border-radius: 6px; margin: 15px 0; }
         .code-block {
@@ -1587,54 +2286,71 @@ class WebInterface:
             return confirm('Are you sure you want to restart the monitor service? This will temporarily stop all monitoring.');
         }
 
-        let countdownTimers = {};
 
-        function formatTime(seconds) {
-            if (seconds <= 0) return 'Now';
-
-            const hours = Math.floor(seconds / 3600);
-            const minutes = Math.floor((seconds % 3600) / 60);
-            const secs = seconds % 60;
-
-            if (hours > 0) {
-                return `${hours}h ${minutes}m ${secs}s`;
-            } else if (minutes > 0) {
-                return `${minutes}m ${secs}s`;
-            } else {
-                return `${secs}s`;
-            }
-        }
-
-        function updateCountdowns() {
-            for (const [type, element] of Object.entries(countdownTimers)) {
-                if (element.seconds > 0) {
-                    element.seconds--;
-                    const timerDiv = document.getElementById(`countdown-${type}`);
-                    if (timerDiv) {
-                        timerDiv.textContent = `Next: ${formatTime(element.seconds)}`;
-                        timerDiv.className = element.seconds <= 60 ? 'countdown-timer soon' : 'countdown-timer';
-                    }
-                } else {
-                    // Timer expired, refresh countdown data
-                    refreshCountdowns();
-                    break;
-                }
-            }
-        }
-
-        async function refreshCountdowns() {
+        async function updateLastRuns() {
             try {
-                const response = await fetch('/api/schedules');
+                const response = await fetch('/api/last-runs');
                 const data = await response.json();
 
                 if (data.success) {
-                    countdownTimers = {};
-                    for (const [type, seconds] of Object.entries(data.schedules)) {
-                        countdownTimers[type] = { seconds: seconds };
+                    // Update WiFi sync last run
+                    const wifiDiv = document.getElementById('countdown-wifi_sync');
+                    if (wifiDiv && data.last_runs.wifi_sync) {
+                        wifiDiv.textContent = `Last Run: ${data.last_runs.wifi_sync}`;
+                        wifiDiv.className = 'last-run-timer';
+                    }
+
+                    // Update WAN metrics last run
+                    const wanDiv = document.getElementById('countdown-wan_metrics');
+                    if (wanDiv && data.last_runs.wan_metrics) {
+                        wanDiv.textContent = `Last Run: ${data.last_runs.wan_metrics}`;
+                        wanDiv.className = 'last-run-timer';
+                    }
+
+                    // Update client metrics last run
+                    const clientDiv = document.getElementById('countdown-client_metrics');
+                    if (clientDiv && data.last_runs.client_metrics) {
+                        clientDiv.textContent = `Last Run: ${data.last_runs.client_metrics}`;
+                        clientDiv.className = 'last-run-timer';
                     }
                 }
             } catch (error) {
-                console.error('Error refreshing countdowns:', error);
+                console.error('Failed to fetch last run data:', error);
+            }
+        }
+
+
+        async function loadScheduleDescriptions() {
+            try {
+                const response = await fetch('/api/schedule-info');
+                const data = await response.json();
+
+                if (data.success) {
+                    const scheduleInfo = data.schedule_info;
+
+                    // Update WiFi schedule description
+                    if (scheduleInfo.unifi_wifi_schedule) {
+                        document.getElementById('wifi-schedule-desc').textContent =
+                            `Scheduled: ${scheduleInfo.unifi_wifi_schedule.description}`;
+                    }
+
+                    // Update WAN schedule description
+                    if (scheduleInfo.unifi_wan_throughput_schedule) {
+                        document.getElementById('wan-schedule-desc').textContent =
+                            `Scheduled: ${scheduleInfo.unifi_wan_throughput_schedule.description}`;
+                    }
+
+                    // Update Client schedule description
+                    if (scheduleInfo.unifi_client_usage_schedule) {
+                        document.getElementById('client-schedule-desc').textContent =
+                            `Scheduled: ${scheduleInfo.unifi_client_usage_schedule.description}`;
+                    }
+                }
+            } catch (error) {
+                console.error('Error loading schedule descriptions:', error);
+                document.getElementById('wifi-schedule-desc').textContent = 'Schedule: Error loading';
+                document.getElementById('wan-schedule-desc').textContent = 'Schedule: Error loading';
+                document.getElementById('client-schedule-desc').textContent = 'Schedule: Error loading';
             }
         }
 
@@ -1656,10 +2372,10 @@ class WebInterface:
 
         // Initialize countdowns on page load
         document.addEventListener('DOMContentLoaded', function() {
-            refreshCountdowns();
+            updateLastRuns(); // Initial load
+            loadScheduleDescriptions(); // Load schedule descriptions
             getDebugStatus(); // Load debug status
-            setInterval(updateCountdowns, 1000);
-            setInterval(refreshCountdowns, 300000); // Refresh every 5 minutes
+            setInterval(updateLastRuns, 30000); // Update last runs every 30 seconds
 
             // Setup collapsible sections
             const collapsibles = document.getElementsByClassName('collapsible');
@@ -1687,8 +2403,8 @@ class WebInterface:
             <h2>📊 Manual Schedule Triggers</h2>
             <div class="info-box">
                 <strong>WiFi Sync:</strong> Updates QR codes for all wireless networks
-                <div class="schedule-info">Scheduled: Every 30 min on Sunday, every hour Mon-Sat</div>
-                <div id="countdown-wifi_sync" class="countdown-timer">Loading...</div>
+                <div class="schedule-info" id="wifi-schedule-desc">Loading schedule...</div>
+                <div id="countdown-wifi_sync" class="last-run-timer">Loading last run...</div>
             </div>
             <div class="button-grid">
                 <button class="btn btn-primary" id="wifi-btn" onclick="triggerAction('/trigger/wifi', 'wifi-btn')">
@@ -1700,12 +2416,13 @@ class WebInterface:
         <div class="section">
             <h2>📈 Metrics Collection</h2>
             <div class="info-box">
-                <strong>WAN Throughput:</strong> Collects internet speed metrics<br>
+                <strong>WAN Throughput:</strong> Collects internet speed metrics
+                <div class="schedule-info" id="wan-schedule-desc">Loading schedule...</div>
+                <div id="countdown-wan_metrics" class="last-run-timer">Loading last run...</div>
+                <br>
                 <strong>Client Usage:</strong> Monitors individual device bandwidth
-                <div class="next-schedules">
-                    <div id="countdown-wan_metrics" class="countdown-timer">Loading...</div>
-                    <div id="countdown-client_metrics" class="countdown-timer">Loading...</div>
-                </div>
+                <div class="schedule-info" id="client-schedule-desc">Loading schedule...</div>
+                <div id="countdown-client_metrics" class="last-run-timer">Loading last run...</div>
             </div>
             <div class="button-grid">
                 <button class="btn btn-success" id="wan-btn" onclick="triggerAction('/trigger/wan', 'wan-btn')">
@@ -1752,21 +2469,6 @@ class WebInterface:
             <button class="collapsible">📋 Schedule Information</button>
             <div class="content">
                 <div class="api-examples">
-                    <p><span class="method-get">GET</span> <span class="endpoint">/api/schedules</span></p>
-                    <p>Get next execution times for all scheduled tasks (for countdown timers)</p>
-
-                    <strong>Example Request:</strong>
-                    <div class="code-block">curl -X GET http://localhost:5000/api/schedules</div>
-
-                    <strong>Example Response:</strong>
-                    <div class="code-block">{
-  "success": true,
-  "schedules": {
-    "wifi_sync": 1825,
-    "wan_metrics": 3,
-    "client_metrics": 3
-  }
-}</div>
 
                     <hr style="margin: 15px 0;">
 
@@ -1896,12 +2598,13 @@ class WebInterface:
             '''
             return html_template
 
-        @self.app.route('/api/schedules', methods=['GET'])
-        def get_schedules():
-            """Get next schedule times for countdown timers"""
+
+        @self.app.route('/api/schedule-info', methods=['GET'])
+        def get_schedule_info_api():
+            """Get schedule descriptions and configuration info"""
             try:
-                next_times = self.get_next_schedule_times()
-                return jsonify({'success': True, 'schedules': next_times})
+                schedule_info = self.get_schedule_info()
+                return jsonify({'success': True, 'schedule_info': schedule_info})
             except Exception as e:
                 return jsonify({'success': False, 'message': f'Error: {str(e)}'})
 
@@ -1930,6 +2633,127 @@ class WebInterface:
                 return jsonify({'success': True, 'debug_info': debug_info})
             except Exception as e:
                 return jsonify({'success': False, 'message': f'Error: {str(e)}'})
+
+        @self.app.route('/api/last-runs', methods=['GET'])
+        def get_last_runs():
+            """Get last execution times from comprehensive tracking system"""
+            try:
+                # Use new comprehensive tracking system
+                last_runs_data = {}
+
+                for job_type in ['wifi_sync', 'wan_metrics', 'client_metrics']:
+                    latest_run = self.monitor.get_latest_run(job_type)
+                    if latest_run:
+                        timestamp = latest_run['timestamp']
+                        status = latest_run['status']
+                        details = latest_run.get('details', '')
+
+                        # Format the timestamp
+                        time_ago = self.monitor.format_time_ago(timestamp)
+                        formatted_time = f"{timestamp[:19].replace('T', ' ')} ({time_ago})"
+
+                        # Add status indicator if failed
+                        if status == 'failed':
+                            formatted_time += f" [FAILED: {details}]"
+                        elif details:
+                            formatted_time += f" - {details}"
+
+                        last_runs_data[job_type] = formatted_time
+                    else:
+                        last_runs_data[job_type] = 'Never'
+
+                return jsonify({
+                    'success': True,
+                    'last_runs': last_runs_data
+                })
+            except Exception as e:
+                return jsonify({'success': False, 'message': f'Error: {str(e)}'})
+
+        @self.app.route('/debug', methods=['GET'])
+        @self.check_ip_allowed(api_endpoint=False)
+        def debug_page():
+            """Debug page showing raw API data"""
+            import json
+            import datetime
+
+            try:
+                next_times = self.get_next_schedule_times()
+                current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+                debug_html = f'''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Debug - Schedule API Data</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
+        .container {{ max-width: 1000px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+        h1 {{ color: #333; text-align: center; }}
+        .section {{ margin: 20px 0; padding: 15px; border: 1px solid #ddd; border-radius: 5px; }}
+        .json-block {{ background: #2d3748; color: #e2e8f0; padding: 12px; border-radius: 4px; font-family: 'Courier New', monospace; font-size: 12px; overflow-x: auto; white-space: pre; }}
+        .timestamp {{ color: #666; font-size: 14px; text-align: center; margin-bottom: 20px; }}
+        .countdown {{ background: #fff3cd; border: 1px solid #ffeaa7; color: #856404; padding: 8px 12px; border-radius: 4px; font-weight: bold; }}
+        .api-call {{ background: #d4edda; border: 1px solid #c3e6cb; color: #155724; padding: 10px; border-radius: 4px; margin: 10px 0; }}
+        .refresh-btn {{ background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; }}
+        .refresh-btn:hover {{ background: #0056b3; }}
+    </style>
+    <script>
+        function refreshPage() {{
+            window.location.reload();
+        }}
+
+        // Auto-refresh every 10 seconds
+        setTimeout(refreshPage, 10000);
+    </script>
+</head>
+<body>
+    <div class="container">
+        <h1>🔍 Debug - Schedule API Data</h1>
+        <div class="timestamp">Last Updated: {current_time} (Auto-refresh in 10s)</div>
+
+        <button class="refresh-btn" onclick="refreshPage()">🔄 Refresh Now</button>
+
+        <div class="section">
+            <h2>📊 Current Countdown Values</h2>
+            <div class="countdown">WiFi Sync: {next_times.get('wifi_sync', 'N/A')} seconds</div>
+            <div class="countdown">WAN Metrics: {next_times.get('wan_metrics', 'N/A')} seconds</div>
+            <div class="countdown">Client Metrics: {next_times.get('client_metrics', 'N/A')} seconds</div>
+        </div>
+
+
+        <div class="section">
+            <h2>📋 Expected Times (human readable)</h2>
+            <div style="margin: 10px 0;">
+                <strong>WiFi Sync:</strong> {next_times.get('wifi_sync', 0) // 3600}h {(next_times.get('wifi_sync', 0) % 3600) // 60}m {next_times.get('wifi_sync', 0) % 60}s<br>
+                <strong>WAN Metrics:</strong> {next_times.get('wan_metrics', 0) // 3600}h {(next_times.get('wan_metrics', 0) % 3600) // 60}m {next_times.get('wan_metrics', 0) % 60}s<br>
+                <strong>Client Metrics:</strong> {next_times.get('client_metrics', 0) // 3600}h {(next_times.get('client_metrics', 0) % 3600) // 60}m {next_times.get('client_metrics', 0) % 60}s
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>🏠 Navigation</h2>
+            <a href="/" style="color: #007bff; text-decoration: none;">← Back to Main Dashboard</a>
+        </div>
+    </div>
+</body>
+</html>
+                '''
+                return debug_html
+
+            except Exception as e:
+                return f'''
+<!DOCTYPE html>
+<html>
+<head><title>Debug Error</title></head>
+<body>
+    <h1>Debug Error</h1>
+    <p>Error loading debug data: {str(e)}</p>
+    <a href="/">← Back to Main Dashboard</a>
+</body>
+</html>
+                '''
 
         @self.app.route('/trigger/wifi', methods=['POST'])
         @self.check_ip_allowed(api_endpoint=True)
@@ -2002,16 +2826,55 @@ class WebInterface:
             try:
                 logging.info("Service restart requested via web interface")
 
-                # Schedule restart in a separate thread to allow response to be sent
-                def restart_in_background():
-                    time.sleep(2)  # Allow time for response to be sent
-                    logging.info("Restarting service...")
-                    os.execv(sys.executable, ['python'] + sys.argv)
+                # Get system configuration
+                system_config = self.monitor.config.get('system', {})
+                use_systemctl = system_config.get('use_systemctl_restart', True)
+                service_name = system_config.get('service_name', 'unifi-monitor')
 
-                restart_thread = threading.Thread(target=restart_in_background, daemon=True)
-                restart_thread.start()
+                if use_systemctl:
+                    # Use systemctl for proper service restart (Linux/Unix)
+                    import subprocess
+                    import platform
 
-                return jsonify({'success': True, 'message': 'Service restart initiated... Please refresh page in a few seconds.'})
+                    def systemctl_restart():
+                        time.sleep(2)  # Allow time for response to be sent
+                        try:
+                            if platform.system() == "Windows":
+                                logging.warning("systemctl not available on Windows, falling back to legacy restart")
+                                logging.info("Restarting service using legacy method...")
+                                os.execv(sys.executable, ['python'] + sys.argv)
+                            else:
+                                logging.info(f"Restarting service via systemctl: {service_name}")
+                                result = subprocess.run(['systemctl', 'restart', service_name],
+                                                      check=True, capture_output=True, text=True)
+                                logging.info(f"Service restart command completed: {result}")
+                        except subprocess.CalledProcessError as e:
+                            logging.error(f"Systemctl restart failed: {e}")
+                            logging.error(f"Stderr: {e.stderr}")
+                            logging.warning("Falling back to legacy restart")
+                            logging.info("Restarting service using legacy method...")
+                            os.execv(sys.executable, ['python'] + sys.argv)
+                        except FileNotFoundError:
+                            logging.warning("systemctl not found, falling back to legacy restart")
+                            logging.info("Restarting service using legacy method...")
+                            os.execv(sys.executable, ['python'] + sys.argv)
+
+                    restart_thread = threading.Thread(target=systemctl_restart, daemon=True)
+                    restart_thread.start()
+
+                    return jsonify({'success': True, 'message': f'Service restart initiated... Please refresh page in a few seconds.'})
+                else:
+                    # Legacy restart method
+                    def restart_in_background():
+                        time.sleep(2)  # Allow time for response to be sent
+                        logging.info("Restarting service using legacy method...")
+                        os.execv(sys.executable, ['python'] + sys.argv)
+
+                    restart_thread = threading.Thread(target=restart_in_background, daemon=True)
+                    restart_thread.start()
+
+                    return jsonify({'success': True, 'message': 'Service restart initiated using legacy method... Please refresh page in a few seconds.'})
+
             except Exception as e:
                 logging.error(f"Restart failed: {e}")
                 return jsonify({'success': False, 'message': f'Restart failed: {str(e)}'})
@@ -2025,6 +2888,9 @@ class WebInterface:
             logging.error(f"Failed to start web interface: {e}")
 
 def main():
+    # Clear Python cache on startup
+    clear_python_cache()
+
     monitor = NetworkMonitor()
 
     # Check if web interface is requested or enabled in config
