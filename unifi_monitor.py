@@ -18,11 +18,12 @@ import schedule
 import threading
 import os
 import sys
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 import ipaddress
 from functools import wraps
 import glob
 import shutil
+import subprocess
 
 # Disable SSL warnings for self-signed certificates
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -80,7 +81,6 @@ def clear_python_cache():
 
                 # Also try system-wide Python cache clearing
                 try:
-                    import sys
                     if hasattr(sys, 'path'):
                         for path in sys.path:
                             if os.path.exists(path):
@@ -106,12 +106,13 @@ def clear_python_cache():
                 # Restore original working directory
                 os.chdir(original_cwd)
 
-            except Exception:
+            except Exception as e:
                 # Continue with next directory if this one fails
+                logging.debug(f"Cache clear failed for directory: {e}")
                 try:
                     os.chdir(original_cwd)
-                except:
-                    pass
+                except (OSError, IOError) as restore_error:
+                    logging.debug(f"Failed to restore directory: {restore_error}")
                 continue
 
         # Force Python to invalidate import cache
@@ -300,11 +301,6 @@ class UniFiController:
 
     def _make_authenticated_request(self, url: str, max_retries: int = 2):
         """Make authenticated request with automatic re-authentication and restart fallback"""
-        import time
-        import subprocess
-        import os
-        import sys
-
         for attempt in range(max_retries + 1):
             try:
                 # Ensure we're authenticated
@@ -371,8 +367,6 @@ class UniFiController:
         """Trigger service restart using configured method"""
         try:
             import threading
-            import time
-
             def restart_service():
                 time.sleep(3)  # Allow current operations to complete
 
@@ -596,7 +590,18 @@ class UniFiController:
                         client_usage = []
                         for client in clients:
                             # Get client identification
-                            hostname = client.get('hostname', client.get('name', 'Unknown'))
+                            #------------------------------------------------------------------------------------
+                            #hostname = client.get('hostname', client.get('name', 'Unknown'))
+                            
+                            #(1)
+                            # Get display name: prefer alias, fall back to hostname, then 'Unknown'
+                            display_name = client.get('name') or client.get('hostname') or 'Unknown'
+                            hostname = display_name
+                            
+                            #(2)
+                            # Prefer alias over hostname (alias is user-set in UniFi)
+                            #hostname = client.get('name') or client.get('hostname', 'Unknown')
+                            
                             mac = client.get('mac', 'Unknown')
                             ip = client.get('ip', 'Unknown')
 
@@ -1408,6 +1413,46 @@ class NetworkMonitor:
             logging.info(f"Created sample config file: {self.config_file}")
             logging.info("Please update the configuration file with your settings")
             exit(1)
+        except json.JSONDecodeError as e:
+            logging.error(f"Corrupted configuration file {self.config_file}: {e}")
+            logging.error(f"Error at line {e.lineno}, column {e.colno}")
+            # Backup corrupted file
+            backup_file = f"{self.config_file}.corrupted.{int(time.time())}"
+            shutil.copy(self.config_file, backup_file)
+            logging.info(f"Backed up corrupted config to {backup_file}")
+            logging.error("Please fix the configuration file or delete it to create a new one")
+            exit(1)
+        except (IOError, OSError) as e:
+            logging.error(f"Failed to read configuration file {self.config_file}: {e}")
+            exit(1)
+
+    def _atomic_write_json(self, file_path: str, data: Dict):
+        """Atomically write JSON data to a file using temp file and rename"""
+        temp_file = f"{file_path}.tmp.{os.getpid()}"
+        try:
+            # Write to temporary file first
+            with open(temp_file, 'w') as f:
+                json.dump(data, f, indent=2)
+            # Atomic rename (on same filesystem)
+            os.replace(temp_file, file_path)
+        except (IOError, OSError) as e:
+            # Clean up temp file on error
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except (IOError, OSError):
+                    pass
+            logging.error(f"Failed to write file {file_path}: {e}")
+            raise
+        except json.JSONEncodeError as e:
+            # Clean up temp file on error
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except (IOError, OSError):
+                    pass
+            logging.error(f"Invalid data for {file_path}: {e}")
+            raise
 
     def load_state(self) -> Dict:
         """Load previous network state"""
@@ -1416,11 +1461,26 @@ class NetworkMonitor:
                 return json.load(f)
         except FileNotFoundError:
             return {}
+        except json.JSONDecodeError as e:
+            logging.error(f"Corrupted state file {self.state_file}: {e}")
+            # Backup corrupted file
+            backup_file = f"{self.state_file}.corrupted.{int(time.time())}"
+            try:
+                shutil.copy(self.state_file, backup_file)
+                logging.info(f"Backed up corrupted state to {backup_file}")
+            except (IOError, OSError) as backup_error:
+                logging.warning(f"Failed to backup corrupted file: {backup_error}")
+            return {}
+        except (IOError, OSError) as e:
+            logging.error(f"Failed to read state file {self.state_file}: {e}")
+            return {}
 
     def save_state(self, state: Dict):
         """Save current network state"""
-        with open(self.state_file, 'w') as f:
-            json.dump(state, f, indent=2)
+        try:
+            self._atomic_write_json(self.state_file, state)
+        except Exception as e:
+            logging.error(f"Failed to save state: {e}")
 
     def load_network_mapping(self) -> Dict:
         """Load UniFi network ID -> QR ID mapping"""
@@ -1429,28 +1489,59 @@ class NetworkMonitor:
                 return json.load(f)
         except FileNotFoundError:
             return {}
+        except json.JSONDecodeError as e:
+            logging.error(f"Corrupted mapping file {self.mapping_file}: {e}")
+            # Backup corrupted file
+            backup_file = f"{self.mapping_file}.corrupted.{int(time.time())}"
+            try:
+                shutil.copy(self.mapping_file, backup_file)
+                logging.info(f"Backed up corrupted mapping to {backup_file}")
+            except (IOError, OSError) as backup_error:
+                logging.warning(f"Failed to backup corrupted file: {backup_error}")
+            return {}
+        except (IOError, OSError) as e:
+            logging.error(f"Failed to read mapping file {self.mapping_file}: {e}")
+            return {}
 
     def save_network_mapping(self, mapping: Dict):
         """Save UniFi network ID -> QR ID mapping"""
-        with open(self.mapping_file, 'w') as f:
-            json.dump(mapping, f, indent=2)
+        try:
+            self._atomic_write_json(self.mapping_file, mapping)
+        except Exception as e:
+            logging.error(f"Failed to save network mapping: {e}")
 
     def load_last_runs(self) -> Dict:
         """Load last run tracking data"""
+        default_data = {
+            "wifi_sync": [],
+            "wan_metrics": [],
+            "client_metrics": []
+        }
         try:
             with open(self.last_runs_file, 'r') as f:
                 return json.load(f)
         except FileNotFoundError:
-            return {
-                "wifi_sync": [],
-                "wan_metrics": [],
-                "client_metrics": []
-            }
+            return default_data
+        except json.JSONDecodeError as e:
+            logging.error(f"Corrupted last runs file {self.last_runs_file}: {e}")
+            # Backup corrupted file
+            backup_file = f"{self.last_runs_file}.corrupted.{int(time.time())}"
+            try:
+                shutil.copy(self.last_runs_file, backup_file)
+                logging.info(f"Backed up corrupted last runs to {backup_file}")
+            except (IOError, OSError) as backup_error:
+                logging.warning(f"Failed to backup corrupted file: {backup_error}")
+            return default_data
+        except (IOError, OSError) as e:
+            logging.error(f"Failed to read last runs file {self.last_runs_file}: {e}")
+            return default_data
 
     def save_last_runs(self, last_runs: Dict):
         """Save last run tracking data"""
-        with open(self.last_runs_file, 'w') as f:
-            json.dump(last_runs, f, indent=2)
+        try:
+            self._atomic_write_json(self.last_runs_file, last_runs)
+        except Exception as e:
+            logging.error(f"Failed to save last runs: {e}")
 
     def record_last_run(self, job_type: str, timestamp: str = None, status: str = "success", details: str = ""):
         """Record a job execution with timestamp and details"""
@@ -1515,7 +1606,8 @@ class NetworkMonitor:
             else:
                 days = total_seconds // 86400
                 return f"{days} day{'s' if days != 1 else ''} ago"
-        except:
+        except (ValueError, TypeError, AttributeError) as e:
+            logging.debug(f"Time formatting error: {e}")
             return "Unknown"
 
     def get_network_hash(self, network: Dict) -> str:
@@ -1860,8 +1952,15 @@ class WebInterface:
         self.allowed_ips = web_config.get('allowed_ips', ['127.0.0.1', '::1'])
         self.allow_all_for_dashboard = web_config.get('allow_all_for_dashboard', True)
 
+        # Set up static directory path (absolute path for reliability)
+        self.static_dir = os.path.abspath('static')
+        if not os.path.exists(self.static_dir):
+            os.makedirs(self.static_dir)
+            self.debug.log('web', 'INFO', f"Created static directory: {self.static_dir}")
+
         self.debug.log('web', 'INFO', f"Web interface initialized on port {port}")
         self.debug.log('web', 'DEBUG', f"Allowed IPs: {self.allowed_ips}")
+        self.debug.log('web', 'DEBUG', f"Static directory: {self.static_dir}")
 
         self.setup_routes()
 
@@ -1984,207 +2083,6 @@ class WebInterface:
 
         return schedule_info
 
-    def get_next_schedule_times(self):
-        """Get next execution times for scheduled tasks"""
-        # CODE VERSION: 2025-09-19-v2 - Enhanced cache clearing and schedule detection
-        next_times = {}
-        try:
-            now = datetime.now()
-
-            for job in schedule.jobs:
-                job_func_str = str(job.job_func)
-                next_run = job.next_run
-
-                # Debug logging to see what jobs we have
-                logging.debug(f"Checking job: {job_func_str}, next_run: {next_run}")
-
-                if next_run:
-                    # Check if this is a weekday wrapper function
-                    if 'weekday' in job_func_str and 'wrapper' in job_func_str:
-                        # This is a weekday-restricted job, calculate actual next execution
-                        seconds_until = self._calculate_weekday_restricted_next_run(job)
-                        logging.debug(f"Weekday-restricted job seconds_until: {seconds_until}")
-                    else:
-                        # Regular job, use direct next_run time
-                        seconds_until = (next_run - now).total_seconds()
-
-                    if seconds_until and seconds_until > 0:
-                        # Try to get the actual function from the wrapper
-                        actual_func = None
-                        try:
-                            # Check if it's a partial function (wrapper)
-                            if hasattr(job.job_func, 'func'):
-                                # Get the wrapped function's closure variables
-                                closure = job.job_func.func.__closure__
-                                if closure:
-                                    for cell in closure:
-                                        if hasattr(cell.cell_contents, '__name__'):
-                                            actual_func = cell.cell_contents
-                                            break
-                        except:
-                            pass
-
-                        # Determine job type based on actual function or wrapper type
-                        job_type = None
-                        if actual_func:
-                            func_name = actual_func.__name__
-                            if 'sync_networks' in func_name or 'sync_wifi' in func_name:
-                                job_type = 'wifi_sync'
-                            elif 'collect_wan' in func_name:
-                                job_type = 'wan_metrics'
-                            elif 'collect_client' in func_name:
-                                job_type = 'client_metrics'
-
-                        # Fall back to wrapper type analysis if function detection fails
-                        if not job_type:
-                            if ('weekday_interval_wrapper' in job_func_str or 'weekday_hourly_wrapper' in job_func_str):
-                                job_type = 'wifi_sync'  # Default wrapper jobs to WiFi for now
-                            elif 'time_range_wrapper' in job_func_str:
-                                # Need to determine if this is WAN or Client based on execution time patterns
-                                # For now, we'll track all time_range_wrapper jobs and assign them later
-                                if not hasattr(self, '_time_range_jobs'):
-                                    self._time_range_jobs = []
-                                self._time_range_jobs.append((job, seconds_until))
-
-                        if job_type:
-                            # Store the shortest time for each job type
-                            if job_type not in next_times or seconds_until < next_times[job_type]:
-                                next_times[job_type] = int(seconds_until)
-                                logging.debug(f"Added {job_type} timer: {int(seconds_until)} seconds")
-
-            # Handle time_range_wrapper jobs that we couldn't classify
-            if hasattr(self, '_time_range_jobs') and self._time_range_jobs:
-                # Sort by execution time to assign the earliest ones
-                self._time_range_jobs.sort(key=lambda x: x[1])
-
-                # Assign based on number of jobs and timing patterns
-                wan_assigned = False
-                client_assigned = False
-
-                for job, seconds_until in self._time_range_jobs:
-                    if not wan_assigned:
-                        if 'wan_metrics' not in next_times or seconds_until < next_times['wan_metrics']:
-                            next_times['wan_metrics'] = int(seconds_until)
-                        wan_assigned = True
-                    elif not client_assigned:
-                        if 'client_metrics' not in next_times or seconds_until < next_times['client_metrics']:
-                            next_times['client_metrics'] = int(seconds_until)
-                        client_assigned = True
-                    else:
-                        break
-
-                # Clean up temporary tracking
-                delattr(self, '_time_range_jobs')
-
-            logging.debug(f"Final next_times: {next_times}")
-            return next_times
-        except Exception as e:
-            logging.error(f"Error getting schedule times: {e}")
-            return {}
-
-    def _calculate_weekday_restricted_next_run(self, job):
-        """Calculate next actual execution time for weekday-restricted jobs"""
-        try:
-            now = datetime.now()
-
-            # Try to extract weekday from the schedule interval
-            # This is a heuristic based on common patterns
-            if hasattr(job, 'interval') and hasattr(job, 'unit'):
-                if job.unit == 'minutes':
-                    # This is likely "*/30 * * * 0" pattern (every 30 min on Sunday)
-                    interval_minutes = job.interval
-
-                    # Find next Sunday
-                    days_until_sunday = (6 - now.weekday()) % 7  # 0=Monday, 6=Sunday
-
-                    if days_until_sunday == 0:  # Today is Sunday
-                        # Find next 30-minute interval today
-                        current_minute = now.minute
-                        next_interval = ((current_minute // interval_minutes) + 1) * interval_minutes
-
-                        if next_interval < 60:
-                            # Next interval is still this hour
-                            next_execution = now.replace(minute=next_interval, second=0, microsecond=0)
-                        else:
-                            # Next interval is next hour
-                            next_hour = now.hour + 1
-                            if next_hour < 24:
-                                next_execution = now.replace(hour=next_hour, minute=0, second=0, microsecond=0)
-                            else:
-                                # Next execution would be next Sunday
-                                next_execution = now + timedelta(days=7)
-                                next_execution = next_execution.replace(hour=0, minute=0, second=0, microsecond=0)
-
-                        # If calculated time is in the past, go to next Sunday
-                        if next_execution <= now:
-                            next_execution = now + timedelta(days=7)
-                            next_execution = next_execution.replace(hour=0, minute=0, second=0, microsecond=0)
-                    else:
-                        # Next Sunday at midnight (first interval of the day)
-                        next_execution = now + timedelta(days=days_until_sunday)
-                        next_execution = next_execution.replace(hour=0, minute=0, second=0, microsecond=0)
-
-                    return (next_execution - now).total_seconds()
-
-                elif job.unit == 'hours':
-                    # This is likely "0 * * * 1" pattern (every hour on specific day)
-                    # Extract target weekday from the wrapper function
-                    current_weekday = now.weekday()  # 0=Monday, 6=Sunday
-
-                    # For hourly jobs, find the next occurrence of the target day
-                    # For now, we'll use a heuristic - if it's an hourly weekday job,
-                    # find the next occurrence of that weekday
-                    target_weekdays = []
-
-                    # Try to determine which weekdays this job runs on by checking job function
-                    job_func_str = str(job.job_func)
-                    if 'monday' in job_func_str.lower():
-                        target_weekdays = [0]  # Monday
-                    elif 'tuesday' in job_func_str.lower():
-                        target_weekdays = [1]  # Tuesday
-                    elif 'wednesday' in job_func_str.lower():
-                        target_weekdays = [2]  # Wednesday
-                    elif 'thursday' in job_func_str.lower():
-                        target_weekdays = [3]  # Thursday
-                    elif 'friday' in job_func_str.lower():
-                        target_weekdays = [4]  # Friday
-                    elif 'saturday' in job_func_str.lower():
-                        target_weekdays = [5]  # Saturday
-                    elif 'sunday' in job_func_str.lower():
-                        target_weekdays = [6]  # Sunday
-                    else:
-                        # Default to checking multiple weekdays (Monday-Saturday for "0 * * * 1-6" pattern)
-                        target_weekdays = [0, 1, 2, 3, 4, 5]  # Mon-Sat
-
-                    # Find next occurrence of any target weekday
-                    min_days_until = 7  # Start with next week
-                    for target_weekday in target_weekdays:
-                        days_until = (target_weekday - current_weekday) % 7
-                        if days_until == 0:  # Today
-                            # Check if we're past the next hour boundary
-                            next_hour_time = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-                            if next_hour_time > now:
-                                days_until = 0  # Use today
-                            else:
-                                days_until = 7  # Use next week
-                        if days_until < min_days_until:
-                            min_days_until = days_until
-
-                    if min_days_until == 0:  # Today
-                        next_execution = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-                    else:
-                        next_execution = now + timedelta(days=min_days_until)
-                        next_execution = next_execution.replace(hour=0, minute=0, second=0, microsecond=0)
-
-                    return (next_execution - now).total_seconds()
-
-            # Fallback to next scheduled run
-            return (job.next_run - now).total_seconds()
-
-        except Exception as e:
-            logging.debug(f"Error calculating weekday-restricted time: {e}")
-            return (job.next_run - now).total_seconds()
-
     def setup_routes(self):
         """Setup Flask routes"""
 
@@ -2199,6 +2097,8 @@ class WebInterface:
     <title>UniFi Monitor Control Panel</title>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+    <link rel="icon" type="image/x-icon" href="/favicon.ico">
     <style>
         body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
         .container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
@@ -2598,6 +2498,17 @@ class WebInterface:
             '''
             return html_template
 
+        @self.app.route('/static/<path:filename>')
+        @self.check_ip_allowed(api_endpoint=False)
+        def serve_static(filename):
+            """Serve static files (favicon, etc.)"""
+            return send_from_directory(self.static_dir, filename)
+
+        @self.app.route('/favicon.ico')
+        @self.check_ip_allowed(api_endpoint=False)
+        def favicon():
+            """Serve favicon.ico"""
+            return send_from_directory(self.static_dir, 'favicon.ico', mimetype='image/x-icon')
 
         @self.app.route('/api/schedule-info', methods=['GET'])
         def get_schedule_info_api():
@@ -2668,92 +2579,6 @@ class WebInterface:
                 })
             except Exception as e:
                 return jsonify({'success': False, 'message': f'Error: {str(e)}'})
-
-        @self.app.route('/debug', methods=['GET'])
-        @self.check_ip_allowed(api_endpoint=False)
-        def debug_page():
-            """Debug page showing raw API data"""
-            import json
-            import datetime
-
-            try:
-                next_times = self.get_next_schedule_times()
-                current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-                debug_html = f'''
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Debug - Schedule API Data</title>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
-        .container {{ max-width: 1000px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
-        h1 {{ color: #333; text-align: center; }}
-        .section {{ margin: 20px 0; padding: 15px; border: 1px solid #ddd; border-radius: 5px; }}
-        .json-block {{ background: #2d3748; color: #e2e8f0; padding: 12px; border-radius: 4px; font-family: 'Courier New', monospace; font-size: 12px; overflow-x: auto; white-space: pre; }}
-        .timestamp {{ color: #666; font-size: 14px; text-align: center; margin-bottom: 20px; }}
-        .countdown {{ background: #fff3cd; border: 1px solid #ffeaa7; color: #856404; padding: 8px 12px; border-radius: 4px; font-weight: bold; }}
-        .api-call {{ background: #d4edda; border: 1px solid #c3e6cb; color: #155724; padding: 10px; border-radius: 4px; margin: 10px 0; }}
-        .refresh-btn {{ background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; }}
-        .refresh-btn:hover {{ background: #0056b3; }}
-    </style>
-    <script>
-        function refreshPage() {{
-            window.location.reload();
-        }}
-
-        // Auto-refresh every 10 seconds
-        setTimeout(refreshPage, 10000);
-    </script>
-</head>
-<body>
-    <div class="container">
-        <h1>🔍 Debug - Schedule API Data</h1>
-        <div class="timestamp">Last Updated: {current_time} (Auto-refresh in 10s)</div>
-
-        <button class="refresh-btn" onclick="refreshPage()">🔄 Refresh Now</button>
-
-        <div class="section">
-            <h2>📊 Current Countdown Values</h2>
-            <div class="countdown">WiFi Sync: {next_times.get('wifi_sync', 'N/A')} seconds</div>
-            <div class="countdown">WAN Metrics: {next_times.get('wan_metrics', 'N/A')} seconds</div>
-            <div class="countdown">Client Metrics: {next_times.get('client_metrics', 'N/A')} seconds</div>
-        </div>
-
-
-        <div class="section">
-            <h2>📋 Expected Times (human readable)</h2>
-            <div style="margin: 10px 0;">
-                <strong>WiFi Sync:</strong> {next_times.get('wifi_sync', 0) // 3600}h {(next_times.get('wifi_sync', 0) % 3600) // 60}m {next_times.get('wifi_sync', 0) % 60}s<br>
-                <strong>WAN Metrics:</strong> {next_times.get('wan_metrics', 0) // 3600}h {(next_times.get('wan_metrics', 0) % 3600) // 60}m {next_times.get('wan_metrics', 0) % 60}s<br>
-                <strong>Client Metrics:</strong> {next_times.get('client_metrics', 0) // 3600}h {(next_times.get('client_metrics', 0) % 3600) // 60}m {next_times.get('client_metrics', 0) % 60}s
-            </div>
-        </div>
-
-        <div class="section">
-            <h2>🏠 Navigation</h2>
-            <a href="/" style="color: #007bff; text-decoration: none;">← Back to Main Dashboard</a>
-        </div>
-    </div>
-</body>
-</html>
-                '''
-                return debug_html
-
-            except Exception as e:
-                return f'''
-<!DOCTYPE html>
-<html>
-<head><title>Debug Error</title></head>
-<body>
-    <h1>Debug Error</h1>
-    <p>Error loading debug data: {str(e)}</p>
-    <a href="/">← Back to Main Dashboard</a>
-</body>
-</html>
-                '''
 
         @self.app.route('/trigger/wifi', methods=['POST'])
         @self.check_ip_allowed(api_endpoint=True)
@@ -2833,7 +2658,6 @@ class WebInterface:
 
                 if use_systemctl:
                     # Use systemctl for proper service restart (Linux/Unix)
-                    import subprocess
                     import platform
 
                     def systemctl_restart():
@@ -2908,7 +2732,8 @@ def main():
                 web_port = int(sys.argv[web_idx + 1])
             else:
                 web_port = config_port  # Use config port instead of hardcoded 5000
-        except:
+        except (ValueError, IndexError) as e:
+            logging.debug(f"Error parsing --web flag: {e}")
             web_port = config_port
     elif web_enabled:
         # Web interface enabled in config but no --web flag
